@@ -1,0 +1,23 @@
+{
+  "name": "claude-cost-tracker",
+  "displayName": "Claude Cost Tracker",
+  "description": "Shows cumulative Claude API spending in the status bar, updated after each response.",
+  "version": "0.1.0",
+  "publisher": "local",
+  "engines": { "vscode": "^1.85.0" },
+  "categories": ["Other"],
+  "activationEvents": ["onStartupFinished"],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "claudeCost.reset",
+        "title": "Claude Cost: Reset Today's Counter"
+      },
+      {
+        "command": "claudeCost.showBreakdown",
+        "title": "Claude Cost: Show Breakdown"
+      }
+    ]
+  }
+}
