@@ -18,8 +18,15 @@ function loadData() {
 }
 
 function formatCost(usd) {
-  if (usd < 0.01) return `$${(usd * 100).toFixed(2)}¢`;
+  if (usd < 0.001) return `<$0.001`;
+  if (usd < 0.01)  return `$${(usd).toFixed(4)}`;
   return `$${usd.toFixed(3)}`;
+}
+
+function topEntries(obj, n = 5) {
+  return Object.entries(obj || {})
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, n);
 }
 
 function updateStatusBar() {
@@ -33,16 +40,15 @@ function updateStatusBar() {
   const today = new Date().toISOString().slice(0, 10);
   const todayCost = data.by_day?.[today] || 0;
   const totalCost = data.total_cost || 0;
-  const requests  = data.total_requests || 0;
 
   statusBarItem.text = `$(circuit-board) ${formatCost(todayCost)}`;
   statusBarItem.tooltip = [
     `Today: ${formatCost(todayCost)}`,
     `All time: ${formatCost(totalCost)}`,
-    `Requests: ${requests}`,
-    `Last updated: ${data.last_updated || '—'}`,
+    `Requests: ${data.total_requests || 0}`,
+    `Updated: ${data.last_updated || '—'}`,
     '',
-    'Click to show breakdown'
+    'Click for full breakdown'
   ].join('\n');
   statusBarItem.color = todayCost > 1
     ? new vscode.ThemeColor('statusBarItem.warningForeground')
@@ -52,22 +58,44 @@ function updateStatusBar() {
 function showBreakdown() {
   const data = loadData();
   if (!data) {
-    vscode.window.showInformationMessage('No Claude cost data yet. Make some requests first.');
+    vscode.window.showInformationMessage('No Claude cost data yet.');
     return;
   }
 
   const today = new Date().toISOString().slice(0, 10);
-  const lines = [
-    `Today (${today}): ${formatCost(data.by_day?.[today] || 0)}`,
-    `All time: ${formatCost(data.total_cost || 0)}`,
-    `Total requests: ${data.total_requests || 0}`,
-    '',
-    'Last 7 days:'
-  ];
+  const lines = [];
 
+  lines.push(`TODAY (${today}): ${formatCost(data.by_day?.[today] || 0)}`);
+  lines.push(`ALL TIME: ${formatCost(data.total_cost || 0)}  |  Requests: ${data.total_requests || 0}`);
+  lines.push('');
+
+  // Last 7 days
   const days = Object.keys(data.by_day || {}).sort().slice(-7);
-  for (const day of days) {
-    lines.push(`  ${day}: ${formatCost(data.by_day[day])}`);
+  if (days.length) {
+    lines.push('LAST 7 DAYS:');
+    for (const day of days.reverse()) {
+      lines.push(`  ${day}: ${formatCost(data.by_day[day])}`);
+    }
+    lines.push('');
+  }
+
+  // By project
+  const projects = topEntries(data.by_project);
+  if (projects.length) {
+    lines.push('BY PROJECT (top 5):');
+    for (const [name, cost] of projects) {
+      lines.push(`  ${name}: ${formatCost(cost)}`);
+    }
+    lines.push('');
+  }
+
+  // By model
+  const models = topEntries(data.by_model);
+  if (models.length) {
+    lines.push('BY MODEL:');
+    for (const [model, cost] of models) {
+      lines.push(`  ${model}: ${formatCost(cost)}`);
+    }
   }
 
   vscode.window.showInformationMessage(lines.join('\n'), { modal: true }, 'Reset Today')
@@ -109,8 +137,6 @@ function activate(context) {
   context.subscriptions.push({ dispose: () => clearInterval(interval) });
 }
 
-function deactivate() {
-  watcher?.close();
-}
+function deactivate() { watcher?.close(); }
 
 module.exports = { activate, deactivate };

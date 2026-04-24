@@ -2,14 +2,16 @@
 """
 Claude Code Stop hook — tracks API cost per session.
 
-Reads usage data from the Claude Code transcript JSONL, calculates cost
-per model, and writes cumulative stats to ~/.claude/cost_tracker.json.
-The VSCode extension reads that file and shows the total in the status bar.
+Reads usage from the Claude Code transcript JSONL, calculates cost per model,
+and writes to two files:
+  ~/.claude/cost_tracker.json  — summary (totals, by_day, by_project, by_model)
+  ~/.claude/cost_log.jsonl     — detailed log, one line per request
 """
 import json, sys, os
 from datetime import datetime, timezone
 
 COST_FILE = os.path.expanduser("~/.claude/cost_tracker.json")
+LOG_FILE  = os.path.expanduser("~/.claude/cost_log.jsonl")
 
 # Pricing per million tokens: (input, cache_5m_write, cache_1h_write, cache_hit, output)
 PRICING = {
@@ -27,7 +29,7 @@ PRICING = {
     "claude-opus-3":     (15,   18.75, 30,   1.50, 75),
     "claude-haiku-3":    (0.25, 0.30,  0.50, 0.03,  1.25),
 }
-DEFAULT_PRICING = (3, 3.75, 6, 0.30, 15)  # Sonnet 4.6 fallback
+DEFAULT_PRICING = (3, 3.75, 6, 0.30, 15)
 M = 1_000_000
 
 
@@ -41,19 +43,20 @@ def get_pricing(model: str) -> tuple:
 
 def compute_cost(usage: dict, model: str) -> float:
     p_in, p_c5, p_c1h, p_hit, p_out = get_pricing(model)
-    input_tok  = usage.get("input_tokens", 0)
-    output_tok = usage.get("output_tokens", 0)
-    cache_hit  = usage.get("cache_read_input_tokens", 0)
-    cc         = usage.get("cache_creation", {})
-    cache_5m   = cc.get("ephemeral_5m_input_tokens", 0) or usage.get("cache_creation_input_tokens", 0)
-    cache_1h   = cc.get("ephemeral_1h_input_tokens", 0)
+    cc = usage.get("cache_creation", {})
+    cache_5m = cc.get("ephemeral_5m_input_tokens", 0) or usage.get("cache_creation_input_tokens", 0)
+    cache_1h = cc.get("ephemeral_1h_input_tokens", 0)
     return (
-        input_tok  * p_in  / M +
-        output_tok * p_out / M +
-        cache_hit  * p_hit / M +
-        cache_5m   * p_c5  / M +
-        cache_1h   * p_c1h / M
+        usage.get("input_tokens", 0)            * p_in  / M +
+        usage.get("output_tokens", 0)           * p_out / M +
+        usage.get("cache_read_input_tokens", 0) * p_hit / M +
+        cache_5m                                * p_c5  / M +
+        cache_1h                                * p_c1h / M
     )
+
+
+def project_name(cwd: str) -> str:
+    return os.path.basename(cwd.rstrip("/")) if cwd else "unknown"
 
 
 def main():
@@ -63,7 +66,10 @@ def main():
         return
 
     transcript_path = hook_data.get("transcript_path")
-    session_id = hook_data.get("session_id", "unknown")
+    session_id      = hook_data.get("session_id", "unknown")
+    cwd             = hook_data.get("cwd", "")
+    project         = project_name(cwd)
+
     if not transcript_path or not os.path.exists(transcript_path):
         return
 
@@ -76,12 +82,15 @@ def main():
     tracker.setdefault("total_cost", 0)
     tracker.setdefault("total_requests", 0)
     tracker.setdefault("by_day", {})
+    tracker.setdefault("by_project", {})
+    tracker.setdefault("by_model", {})
     tracker.setdefault("sessions", {})
 
-    session  = tracker["sessions"].setdefault(session_id, {"seen_ids": []})
+    session  = tracker["sessions"].setdefault(session_id, {"seen_ids": [], "project": project})
     seen_ids = set(session.get("seen_ids", []))
-    new_cost = 0.0
-    new_ids  = []
+
+    today    = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    log_entries = []
 
     with open(transcript_path) as f:
         for line in f:
@@ -103,22 +112,47 @@ def main():
             if not msg_id or msg_id in seen_ids:
                 continue
 
-            new_cost += compute_cost(usage, msg.get("model", ""))
-            seen_ids.add(msg_id)
-            new_ids.append(msg_id)
+            model = msg.get("model", "unknown")
+            cc    = usage.get("cache_creation", {})
+            cost  = compute_cost(usage, model)
 
-    if new_cost == 0:
+            log_entries.append({
+                "ts":              datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "date":            today,
+                "session_id":      session_id,
+                "project":         project,
+                "cwd":             cwd,
+                "model":           model,
+                "msg_id":          msg_id,
+                "input_tokens":    usage.get("input_tokens", 0),
+                "output_tokens":   usage.get("output_tokens", 0),
+                "cache_read":      usage.get("cache_read_input_tokens", 0),
+                "cache_write_5m":  cc.get("ephemeral_5m_input_tokens", 0) or usage.get("cache_creation_input_tokens", 0),
+                "cache_write_1h":  cc.get("ephemeral_1h_input_tokens", 0),
+                "cost_usd":        round(cost, 8),
+            })
+
+            seen_ids.add(msg_id)
+
+            # Update summary
+            tracker["by_day"][today]          = tracker["by_day"].get(today, 0) + cost
+            tracker["by_project"][project]    = tracker["by_project"].get(project, 0) + cost
+            tracker["by_model"][model]        = tracker["by_model"].get(model, 0) + cost
+            tracker["total_cost"]            += cost
+            tracker["total_requests"]        += 1
+
+    if not log_entries:
         return
 
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    tracker["by_day"][today]  = tracker["by_day"].get(today, 0) + new_cost
-    tracker["total_cost"]    += new_cost
-    tracker["total_requests"] += len(new_ids)
-    tracker["last_updated"]   = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    session["seen_ids"]       = list(seen_ids)
+    tracker["last_updated"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    session["seen_ids"]     = list(seen_ids)
 
     with open(COST_FILE, "w") as f:
         json.dump(tracker, f, indent=2)
+
+    with open(LOG_FILE, "a") as f:
+        for entry in log_entries:
+            f.write(json.dumps(entry) + "\n")
 
 
 if __name__ == "__main__":
