@@ -1,10 +1,14 @@
 const vscode = require('vscode');
-const fs = require('fs');
+const fs   = require('fs');
 const path = require('path');
-const os = require('os');
+const os   = require('os');
+const https = require('https');
+const http  = require('http');
+const { URL } = require('url');
 
 const COST_FILE = path.join(os.homedir(), '.claude', 'cost_tracker.json');
 const LOG_FILE  = path.join(os.homedir(), '.claude', 'cost_log.jsonl');
+const SYNC_ENV  = path.join(os.homedir(), '.claude', 'cost_sync.env');
 
 let statusBarItem;
 let watcher;
@@ -17,19 +21,76 @@ function loadSummary() {
   } catch { return null; }
 }
 
-function loadLog() {
+function loadLocalLog() {
   try {
     if (!fs.existsSync(LOG_FILE)) return [];
     return fs.readFileSync(LOG_FILE, 'utf8')
       .split('\n').filter(Boolean)
-      .map(l => JSON.parse(l));
+      .map(l => { try { return JSON.parse(l); } catch { return null; } })
+      .filter(Boolean);
   } catch { return []; }
 }
 
+function loadSyncConfig() {
+  try {
+    if (!fs.existsSync(SYNC_ENV)) return null;
+    const cfg = {};
+    for (const line of fs.readFileSync(SYNC_ENV, 'utf8').split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#') || !trimmed.includes('=')) continue;
+      const [k, ...v] = trimmed.split('=');
+      cfg[k.trim()] = v.join('=').trim().replace(/^["']|["']$/g, '');
+    }
+    return (cfg.CLAUDE_COST_API_URL && cfg.CLAUDE_COST_API_KEY) ? cfg : null;
+  } catch { return null; }
+}
+
+function fetchJson(url, headers = {}) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(url);
+    const lib = u.protocol === 'https:' ? https : http;
+    const req = lib.request({
+      hostname: u.hostname,
+      port: u.port || (u.protocol === 'https:' ? 443 : 80),
+      path: u.pathname + u.search,
+      method: 'GET',
+      headers,
+      timeout: 10000,
+    }, (res) => {
+      let data = '';
+      res.on('data', c => data += c);
+      res.on('end', () => {
+        if (res.statusCode >= 200 && res.statusCode < 300) {
+          try { resolve(JSON.parse(data)); }
+          catch (e) { reject(e); }
+        } else {
+          reject(new Error(`HTTP ${res.statusCode}: ${data}`));
+        }
+      });
+    });
+    req.on('error', reject);
+    req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
+    req.end();
+  });
+}
+
+async function fetchRemoteLog(from, to) {
+  const cfg = loadSyncConfig();
+  if (!cfg) return null;
+  const url = `${cfg.CLAUDE_COST_API_URL.replace(/\/$/, '')}/report?limit=50000${from?`&from=${from}`:''}${to?`&to=${to}`:''}`;
+  try {
+    const res = await fetchJson(url, { 'X-API-Key': cfg.CLAUDE_COST_API_KEY });
+    return res.entries || [];
+  } catch (e) {
+    console.error('claude-cost fetch failed:', e.message);
+    return null;
+  }
+}
+
 function formatCost(usd) {
-  if (usd < 0.001) return `<$0.001`;
-  if (usd < 0.01)  return `$${usd.toFixed(4)}`;
-  return `$${usd.toFixed(3)}`;
+  if (usd < 0.001) return '<$0.001';
+  if (usd < 0.01)  return '$' + usd.toFixed(4);
+  return '$' + usd.toFixed(3);
 }
 
 function updateStatusBar() {
@@ -41,55 +102,57 @@ function updateStatusBar() {
   }
   const today = new Date().toISOString().slice(0, 10);
   const todayCost = data.by_day?.[today] || 0;
-  statusBarItem.text = `$(circuit-board) ${formatCost(todayCost)}`;
+  const cfg = loadSyncConfig();
+  statusBarItem.text = `$(circuit-board) ${formatCost(todayCost)}${cfg ? ' $(cloud)' : ''}`;
   statusBarItem.tooltip = [
     `Today: ${formatCost(todayCost)}`,
     `All time: ${formatCost(data.total_cost || 0)}`,
     `Requests: ${data.total_requests || 0}`,
     `Updated: ${data.last_updated || '—'}`,
+    cfg ? `Synced to: ${cfg.CLAUDE_COST_API_URL}` : 'Local only',
     '', 'Click for full report'
   ].join('\n');
   statusBarItem.color = todayCost > 1
     ? new vscode.ThemeColor('statusBarItem.warningForeground') : undefined;
-
-  if (panel) panel.webview.postMessage({ type: 'refresh', log: loadLog(), summary: data });
 }
 
-function getWebviewContent(log, summary) {
-  const today = new Date().toISOString().slice(0, 10);
-  const thirtyDaysAgo = new Date(Date.now() - 30 * 86400000).toISOString().slice(0, 10);
-  const logJson = JSON.stringify(log);
-  const summaryJson = JSON.stringify(summary || {});
+function getWebviewContent() {
+  const today          = new Date().toISOString().slice(0, 10);
+  const thirtyDaysAgo  = new Date(Date.now() - 30 * 86400000).toISOString().slice(0, 10);
+  const remoteEnabled  = !!loadSyncConfig();
 
   return `<!DOCTYPE html>
-<html lang="en">
-<head>
+<html lang="en"><head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Claude Cost Report</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: var(--vscode-font-family); font-size: 13px; color: var(--vscode-foreground); background: var(--vscode-editor-background); padding: 16px; }
-  h1 { font-size: 16px; font-weight: 600; margin-bottom: 16px; color: var(--vscode-foreground); }
+  h1 { font-size: 16px; font-weight: 600; margin-bottom: 6px; }
+  .source { color: var(--vscode-descriptionForeground); font-size: 11px; margin-bottom: 14px; }
+  .source .dot { display: inline-block; width:8px; height:8px; border-radius:50%; vertical-align:middle; margin-right:4px; }
+  .dot.local  { background: var(--vscode-charts-yellow, #d4a017); }
+  .dot.remote { background: var(--vscode-charts-green,  #4caf50); }
   .filters { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 16px; align-items: flex-end; }
   .filter-group { display: flex; flex-direction: column; gap: 4px; }
   label { font-size: 11px; color: var(--vscode-descriptionForeground); text-transform: uppercase; letter-spacing: 0.5px; }
   input, select { background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border, #555); padding: 5px 8px; border-radius: 3px; font-size: 12px; }
   button { background: var(--vscode-button-background); color: var(--vscode-button-foreground); border: none; padding: 5px 12px; border-radius: 3px; cursor: pointer; font-size: 12px; }
   button:hover { background: var(--vscode-button-hoverBackground); }
-  button.secondary { background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); }
+  .toggle { display:flex; gap:0; border:1px solid var(--vscode-input-border,#555); border-radius:3px; overflow:hidden; }
+  .toggle button { background:transparent; color:var(--vscode-foreground); border:none; padding:5px 10px; }
+  .toggle button.active { background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
   .cards { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 20px; }
   .card { background: var(--vscode-editor-inactiveSelectionBackground); border: 1px solid var(--vscode-panel-border, #333); border-radius: 6px; padding: 12px 16px; min-width: 140px; }
   .card-label { font-size: 11px; color: var(--vscode-descriptionForeground); text-transform: uppercase; margin-bottom: 4px; }
-  .card-value { font-size: 20px; font-weight: 700; color: var(--vscode-foreground); }
-  .tabs { display: flex; gap: 0; margin-bottom: 16px; border-bottom: 1px solid var(--vscode-panel-border, #333); }
+  .card-value { font-size: 20px; font-weight: 700; }
+  .tabs { display: flex; margin-bottom: 16px; border-bottom: 1px solid var(--vscode-panel-border, #333); }
   .tab { padding: 6px 16px; cursor: pointer; border-bottom: 2px solid transparent; font-size: 12px; color: var(--vscode-descriptionForeground); }
   .tab.active { border-bottom-color: var(--vscode-focusBorder, #007fd4); color: var(--vscode-foreground); }
   .tab-content { display: none; }
   .tab-content.active { display: block; }
   table { width: 100%; border-collapse: collapse; font-size: 12px; }
-  th { text-align: left; padding: 6px 10px; background: var(--vscode-editor-inactiveSelectionBackground); color: var(--vscode-descriptionForeground); font-size: 11px; text-transform: uppercase; letter-spacing: 0.4px; cursor: pointer; user-select: none; }
-  th:hover { color: var(--vscode-foreground); }
+  th { text-align: left; padding: 6px 10px; background: var(--vscode-editor-inactiveSelectionBackground); color: var(--vscode-descriptionForeground); font-size: 11px; text-transform: uppercase; }
   td { padding: 6px 10px; border-bottom: 1px solid var(--vscode-panel-border, #2a2a2a); }
   tr:hover td { background: var(--vscode-list-hoverBackground); }
   .num { text-align: right; font-variant-numeric: tabular-nums; }
@@ -98,38 +161,39 @@ function getWebviewContent(log, summary) {
   .empty { color: var(--vscode-descriptionForeground); padding: 24px; text-align: center; }
   .pagination { display: flex; gap: 8px; align-items: center; margin-top: 12px; font-size: 12px; }
   .pagination button { padding: 3px 8px; }
-</style>
-</head>
+  .loading { color: var(--vscode-descriptionForeground); padding: 12px 0; font-size: 12px; }
+</style></head>
 <body>
-<h1>$(circuit-board) Claude Cost Report</h1>
+<h1>Claude Cost Report</h1>
+<div class="source" id="sourceLabel"></div>
 
 <div class="filters">
-  <div class="filter-group">
-    <label>From</label>
-    <input type="date" id="dateFrom" value="${thirtyDaysAgo}">
+  <div class="filter-group"><label>Source</label>
+    <div class="toggle">
+      ${remoteEnabled
+        ? '<button id="srcRemote" class="active" onclick="setSource(\'remote\')">Remote</button>'
+        : '<button id="srcRemote" disabled title="Configure ~/.claude/cost_sync.env">Remote</button>'}
+      <button id="srcLocal" class="${remoteEnabled?'':'active'}" onclick="setSource('local')">Local</button>
+    </div>
   </div>
+  <div class="filter-group"><label>From</label><input type="date" id="dateFrom" value="${thirtyDaysAgo}"></div>
+  <div class="filter-group"><label>To</label><input type="date" id="dateTo" value="${today}"></div>
+  <div class="filter-group"><label>Project</label><select id="filterProject"><option value="">All projects</option></select></div>
+  <div class="filter-group"><label>Model</label><select id="filterModel"><option value="">All models</option></select></div>
+  <div class="filter-group"><label>Client</label><select id="filterClient"><option value="">All clients</option></select></div>
   <div class="filter-group">
-    <label>To</label>
-    <input type="date" id="dateTo" value="${today}">
-  </div>
-  <div class="filter-group">
-    <label>Project</label>
-    <select id="filterProject"><option value="">All projects</option></select>
-  </div>
-  <div class="filter-group">
-    <label>Model</label>
-    <select id="filterModel"><option value="">All models</option></select>
-  </div>
-  <div class="filter-group" style="justify-content:flex-end">
     <label>&nbsp;</label>
     <div style="display:flex;gap:6px">
       <button onclick="setRange('today')">Today</button>
       <button onclick="setRange('7d')">7d</button>
       <button onclick="setRange('30d')">30d</button>
       <button onclick="setRange('all')">All</button>
+      <button onclick="reload()">↻ Refresh</button>
     </div>
   </div>
 </div>
+
+<div class="loading" id="loading"></div>
 
 <div class="cards">
   <div class="card"><div class="card-label">Total cost</div><div class="card-value" id="cardCost">—</div></div>
@@ -142,26 +206,25 @@ function getWebviewContent(log, summary) {
   <div class="tab active" onclick="switchTab('days')">By Day</div>
   <div class="tab" onclick="switchTab('projects')">By Project</div>
   <div class="tab" onclick="switchTab('models')">By Model</div>
+  <div class="tab" onclick="switchTab('clients')">By Client</div>
   <div class="tab" onclick="switchTab('log')">Raw Log</div>
 </div>
 
 <div id="tab-days" class="tab-content active"></div>
 <div id="tab-projects" class="tab-content"></div>
 <div id="tab-models" class="tab-content"></div>
+<div id="tab-clients" class="tab-content"></div>
 <div id="tab-log" class="tab-content">
-  <div class="pagination">
-    <button onclick="prevPage()">‹</button>
-    <span id="pageInfo"></span>
-    <button onclick="nextPage()">›</button>
-  </div>
+  <div class="pagination"><button onclick="prevPage()">‹</button><span id="pageInfo"></span><button onclick="nextPage()">›</button></div>
   <div id="logTable"></div>
 </div>
 
 <script>
-const RAW_LOG = ${logJson};
-const SUMMARY = ${summaryJson};
+const REMOTE_ENABLED = ${remoteEnabled};
+const vscode = acquireVsCodeApi();
+let RAW_LOG = [];
 let filtered = [];
-let sortCol = 'ts'; let sortAsc = false;
+let source = REMOTE_ENABLED ? 'remote' : 'local';
 let logPage = 0; const PAGE = 50;
 
 function fmt(usd) {
@@ -175,36 +238,47 @@ function fmtK(n) {
   return String(n);
 }
 
-function getFilters() {
-  return {
+function setSource(s) {
+  source = s;
+  document.getElementById('srcRemote').classList.toggle('active', s === 'remote');
+  document.getElementById('srcLocal').classList.toggle('active', s === 'local');
+  reload();
+}
+
+function setRange(r) {
+  const today = new Date().toISOString().slice(0,10);
+  document.getElementById('dateTo').value = today;
+  if (r === 'today') document.getElementById('dateFrom').value = today;
+  else if (r === '7d')  document.getElementById('dateFrom').value = new Date(Date.now()-7*86400000).toISOString().slice(0,10);
+  else if (r === '30d') document.getElementById('dateFrom').value = new Date(Date.now()-30*86400000).toISOString().slice(0,10);
+  else if (r === 'all') document.getElementById('dateFrom').value = '2024-01-01';
+  reload();
+}
+
+function reload() {
+  document.getElementById('loading').textContent = 'Loading...';
+  const f = { from: document.getElementById('dateFrom').value, to: document.getElementById('dateTo').value };
+  vscode.postMessage({ type: 'load', source, ...f });
+}
+
+function applyFilters() {
+  const f = {
     from:    document.getElementById('dateFrom').value,
     to:      document.getElementById('dateTo').value,
     project: document.getElementById('filterProject').value,
     model:   document.getElementById('filterModel').value,
+    client:  document.getElementById('filterClient').value,
   };
-}
-
-function applyFilters() {
-  const f = getFilters();
   filtered = RAW_LOG.filter(r => {
     if (f.from && r.date < f.from) return false;
     if (f.to   && r.date > f.to)   return false;
     if (f.project && r.project !== f.project) return false;
     if (f.model   && r.model   !== f.model)   return false;
+    if (f.client  && r.client_id !== f.client) return false;
     return true;
   });
   logPage = 0;
   render();
-}
-
-function setRange(range) {
-  const today = new Date().toISOString().slice(0,10);
-  document.getElementById('dateTo').value = today;
-  if (range === 'today') document.getElementById('dateFrom').value = today;
-  else if (range === '7d')  document.getElementById('dateFrom').value = new Date(Date.now()-7*86400000).toISOString().slice(0,10);
-  else if (range === '30d') document.getElementById('dateFrom').value = new Date(Date.now()-30*86400000).toISOString().slice(0,10);
-  else if (range === 'all') document.getElementById('dateFrom').value = '2024-01-01';
-  applyFilters();
 }
 
 function aggregate(key) {
@@ -212,7 +286,7 @@ function aggregate(key) {
   for (const r of filtered) {
     const k = r[key] || 'unknown';
     if (!map[k]) map[k] = { cost: 0, reqs: 0, output: 0, cache_read: 0 };
-    map[k].cost       += r.cost_usd;
+    map[k].cost       += r.cost_usd || 0;
     map[k].reqs       += 1;
     map[k].output     += r.output_tokens || 0;
     map[k].cache_read += r.cache_read    || 0;
@@ -221,17 +295,17 @@ function aggregate(key) {
 }
 
 function makeTable(rows, cols) {
-  if (!rows.length) return '<div class="empty">No data for selected range</div>';
+  if (!rows.length) return '<div class="empty">No data for selected filters</div>';
   const maxCost = Math.max(...rows.map(r => r[1].cost));
-  let html = '<table><tr>' + cols.map(c => \`<th>\${c.label}</th>\`).join('') + '</tr>';
+  let html = '<table><tr>' + cols.map(c => '<th>' + c.label + '</th>').join('') + '</tr>';
   for (const [key, v] of rows) {
     const pct = maxCost > 0 ? (v.cost / maxCost * 120) : 0;
     html += '<tr>' + cols.map(c => {
-      if (c.key === 'name') return \`<td>\${key}</td>\`;
-      if (c.key === 'bar')  return \`<td><div class="bar-wrap"><div class="bar" style="width:\${pct}px"></div><span>\${fmt(v.cost)}</span></div></td>\`;
-      if (c.key === 'reqs') return \`<td class="num">\${v.reqs}</td>\`;
-      if (c.key === 'output') return \`<td class="num">\${fmtK(v.output)}</td>\`;
-      if (c.key === 'cache') return \`<td class="num">\${fmtK(v.cache_read)}</td>\`;
+      if (c.key === 'name')   return '<td>' + key + '</td>';
+      if (c.key === 'bar')    return '<td><div class="bar-wrap"><div class="bar" style="width:' + pct + 'px"></div><span>' + fmt(v.cost) + '</span></div></td>';
+      if (c.key === 'reqs')   return '<td class="num">' + v.reqs + '</td>';
+      if (c.key === 'output') return '<td class="num">' + fmtK(v.output) + '</td>';
+      if (c.key === 'cache')  return '<td class="num">' + fmtK(v.cache_read) + '</td>';
       return '<td></td>';
     }).join('') + '</tr>';
   }
@@ -239,13 +313,11 @@ function makeTable(rows, cols) {
 }
 
 function render() {
-  // Cards
-  const total   = filtered.reduce((s,r) => s + r.cost_usd, 0);
-  const reqs    = filtered.length;
-  const outTok  = filtered.reduce((s,r) => s + (r.output_tokens||0), 0);
+  const total    = filtered.reduce((s,r) => s + (r.cost_usd||0), 0);
+  const reqs     = filtered.length;
+  const outTok   = filtered.reduce((s,r) => s + (r.output_tokens||0), 0);
   const cacheTok = filtered.reduce((s,r) => s + (r.cache_read||0), 0);
-  const PRICES  = { input:3, output:15, cache_read:0.3, cache_write_5m:3.75 };
-  const cacheSaved = cacheTok * (PRICES.input - PRICES.cache_read) / 1e6;
+  const cacheSaved = cacheTok * (3 - 0.3) / 1e6;
 
   document.getElementById('cardCost').textContent  = fmt(total);
   document.getElementById('cardReqs').textContent  = reqs;
@@ -253,53 +325,27 @@ function render() {
   document.getElementById('cardCache').textContent = fmt(cacheSaved);
 
   const cols = [
-    { label: 'Name',        key: 'name'   },
-    { label: 'Cost',        key: 'bar'    },
-    { label: 'Requests',   key: 'reqs'   },
+    { label: 'Name', key: 'name' },
+    { label: 'Cost', key: 'bar' },
+    { label: 'Requests', key: 'reqs' },
     { label: 'Output tok', key: 'output' },
-    { label: 'Cache read', key: 'cache'  },
+    { label: 'Cache read', key: 'cache' },
   ];
-
-  // Days
-  document.getElementById('tab-days').innerHTML = makeTable(
-    aggregate('date').sort((a,b) => b[0].localeCompare(a[0])), cols
-  );
-
-  // Projects
+  document.getElementById('tab-days').innerHTML     = makeTable(aggregate('date').sort((a,b) => b[0].localeCompare(a[0])), cols);
   document.getElementById('tab-projects').innerHTML = makeTable(aggregate('project'), cols);
-
-  // Models
-  document.getElementById('tab-models').innerHTML = makeTable(aggregate('model'), cols);
-
-  // Log
+  document.getElementById('tab-models').innerHTML   = makeTable(aggregate('model'), cols);
+  document.getElementById('tab-clients').innerHTML  = makeTable(aggregate('client_id'), cols);
   renderLog();
 }
 
 function renderLog() {
   const start = logPage * PAGE;
   const page  = filtered.slice(start, start + PAGE);
-  document.getElementById('pageInfo').textContent =
-    \`\${start+1}–\${Math.min(start+PAGE, filtered.length)} of \${filtered.length}\`;
-
-  if (!page.length) {
-    document.getElementById('logTable').innerHTML = '<div class="empty">No data</div>';
-    return;
-  }
-  let html = \`<table><tr>
-    <th>Date</th><th>Project</th><th>Model</th>
-    <th class="num">Input</th><th class="num">Output</th>
-    <th class="num">Cache read</th><th class="num">Cost</th>
-  </tr>\`;
+  document.getElementById('pageInfo').textContent = (start+1) + '–' + Math.min(start+PAGE, filtered.length) + ' of ' + filtered.length;
+  if (!page.length) { document.getElementById('logTable').innerHTML = '<div class="empty">No data</div>'; return; }
+  let html = '<table><tr><th>Date</th><th>Project</th><th>Model</th><th>Client</th><th class="num">Input</th><th class="num">Output</th><th class="num">Cache read</th><th class="num">Cost</th></tr>';
   for (const r of page) {
-    html += \`<tr>
-      <td>\${r.date}</td>
-      <td>\${r.project||'—'}</td>
-      <td>\${(r.model||'').replace('claude-','')}</td>
-      <td class="num">\${fmtK(r.input_tokens||0)}</td>
-      <td class="num">\${fmtK(r.output_tokens||0)}</td>
-      <td class="num">\${fmtK(r.cache_read||0)}</td>
-      <td class="num">\${fmt(r.cost_usd)}</td>
-    </tr>\`;
+    html += '<tr><td>' + r.date + '</td><td>' + (r.project||'—') + '</td><td>' + ((r.model||'').replace('claude-','')) + '</td><td>' + (r.client_id||'—') + '</td><td class="num">' + fmtK(r.input_tokens||0) + '</td><td class="num">' + fmtK(r.output_tokens||0) + '</td><td class="num">' + fmtK(r.cache_read||0) + '</td><td class="num">' + fmt(r.cost_usd||0) + '</td></tr>';
   }
   document.getElementById('logTable').innerHTML = html + '</table>';
 }
@@ -308,46 +354,60 @@ function prevPage() { if (logPage > 0) { logPage--; renderLog(); } }
 function nextPage() { if ((logPage+1)*PAGE < filtered.length) { logPage++; renderLog(); } }
 
 function switchTab(name) {
-  document.querySelectorAll('.tab').forEach((t,i) => {
-    const names = ['days','projects','models','log'];
-    t.classList.toggle('active', names[i] === name);
-  });
+  const names = ['days','projects','models','clients','log'];
+  document.querySelectorAll('.tab').forEach((t,i) => t.classList.toggle('active', names[i] === name));
   document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
   document.getElementById('tab-'+name).classList.add('active');
 }
 
-// Populate filter dropdowns
 function initFilters() {
   const projects = [...new Set(RAW_LOG.map(r => r.project).filter(Boolean))].sort();
   const models   = [...new Set(RAW_LOG.map(r => r.model).filter(Boolean))].sort();
-  const pSel = document.getElementById('filterProject');
-  const mSel = document.getElementById('filterModel');
-  projects.forEach(p => { const o = document.createElement('option'); o.value = p; o.textContent = p; pSel.appendChild(o); });
-  models.forEach(m => { const o = document.createElement('option'); o.value = m; o.textContent = m.replace('claude-',''); mSel.appendChild(o); });
+  const clients  = [...new Set(RAW_LOG.map(r => r.client_id).filter(Boolean))].sort();
+  const fill = (selId, items, transform) => {
+    const sel = document.getElementById(selId);
+    const cur = sel.value;
+    sel.innerHTML = '<option value="">All</option>';
+    items.forEach(p => {
+      const o = document.createElement('option');
+      o.value = p; o.textContent = transform ? transform(p) : p;
+      sel.appendChild(o);
+    });
+    sel.value = cur;
+  };
+  fill('filterProject', projects);
+  fill('filterModel', models, m => m.replace('claude-',''));
+  fill('filterClient', clients);
 }
 
-// Events
-['dateFrom','dateTo','filterProject','filterModel'].forEach(id =>
+['dateFrom','dateTo'].forEach(id =>
+  document.getElementById(id).addEventListener('change', reload)
+);
+['filterProject','filterModel','filterClient'].forEach(id =>
   document.getElementById(id).addEventListener('change', applyFilters)
 );
 
-// VSCode message (live refresh)
 window.addEventListener('message', e => {
-  if (e.data.type === 'refresh') {
-    RAW_LOG.length = 0;
-    RAW_LOG.push(...e.data.log);
+  if (e.data.type === 'data') {
+    RAW_LOG = e.data.entries || [];
+    document.getElementById('loading').textContent = '';
+    document.getElementById('sourceLabel').innerHTML =
+      '<span class="dot ' + (e.data.source === 'remote' ? 'remote' : 'local') + '"></span>' +
+      (e.data.source === 'remote' ? 'Remote (server)' : 'Local (this machine only)') +
+      ' · ' + RAW_LOG.length + ' entries';
+    initFilters();
     applyFilters();
+  } else if (e.data.type === 'error') {
+    document.getElementById('loading').textContent = '⚠ ' + e.data.message;
   }
 });
 
-initFilters();
-applyFilters();
+reload();
 </script>
-</body>
-</html>`;
+</body></html>`;
 }
 
-function showBreakdown() {
+async function showBreakdown(context) {
   if (panel) { panel.reveal(); return; }
 
   panel = vscode.window.createWebviewPanel(
@@ -356,7 +416,27 @@ function showBreakdown() {
     { enableScripts: true, retainContextWhenHidden: true }
   );
 
-  panel.webview.html = getWebviewContent(loadLog(), loadSummary());
+  panel.webview.html = getWebviewContent();
+
+  panel.webview.onDidReceiveMessage(async (msg) => {
+    if (msg.type === 'load') {
+      let entries;
+      if (msg.source === 'remote') {
+        entries = await fetchRemoteLog(msg.from, msg.to);
+        if (entries === null) {
+          panel.webview.postMessage({ type: 'error', message: 'Remote fetch failed — check network or API key' });
+          return;
+        }
+      } else {
+        entries = loadLocalLog().filter(r => {
+          if (msg.from && r.date < msg.from) return false;
+          if (msg.to   && r.date > msg.to)   return false;
+          return true;
+        });
+      }
+      panel.webview.postMessage({ type: 'data', entries, source: msg.source });
+    }
+  });
 
   panel.onDidDispose(() => { panel = null; });
 }
@@ -379,7 +459,7 @@ function activate(context) {
 
   context.subscriptions.push(
     vscode.commands.registerCommand('claudeCost.reset', resetToday),
-    vscode.commands.registerCommand('claudeCost.showBreakdown', showBreakdown)
+    vscode.commands.registerCommand('claudeCost.showBreakdown', () => showBreakdown(context)),
   );
 
   updateStatusBar();
@@ -391,7 +471,6 @@ function activate(context) {
     });
     context.subscriptions.push({ dispose: () => watcher?.close() });
   }
-
   const interval = setInterval(updateStatusBar, 30000);
   context.subscriptions.push({ dispose: () => clearInterval(interval) });
 }

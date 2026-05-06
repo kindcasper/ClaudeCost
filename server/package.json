@@ -1,0 +1,16 @@
+{
+  "name": "claude-cost-server",
+  "version": "0.1.0",
+  "description": "Sync server for Claude Cost Tracker — receives usage logs from clients, stores in SQLite, exposes report API",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "better-sqlite3": "^11.3.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

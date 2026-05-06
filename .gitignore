@@ -1,0 +1,10 @@
+node_modules/
+*.log
+.DS_Store
+
+# Secrets — never commit
+.env
+.env.local
+*.sqlite
+*.sqlite-*
+data/

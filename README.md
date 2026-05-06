@@ -1,96 +1,94 @@
 # Claude Cost Tracker
 
-Shows your Claude API spending in the VSCode status bar, updated automatically after each response.
+Track your Claude API spending across multiple machines. Status bar widget in VSCode, optional self-hosted sync server with per-machine breakdowns.
 
-![Status bar showing Claude cost](https://i.imgur.com/placeholder.png)
+## Components
+
+```
+ClaudeCost/
+├── hooks/                  — Claude Code Stop hook (Python)
+│   ├── cost_tracker.py     — fires after each response, writes local JSON + pushes to server
+│   └── backfill_to_server.py — one-shot backfill of existing local log
+│
+├── vscode-extension/       — VSCode extension showing status bar + report panel
+│   ├── extension.js
+│   └── package.json
+│
+├── server/                 — optional self-hosted sync server (Node.js + SQLite)
+│   ├── server.js           — Express API
+│   ├── README.md           — server setup
+│   └── ecosystem.config.js — PM2 config
+│
+└── install.sh              — installs hook + extension on a single machine
+```
 
 ## How it works
 
 ```
 Claude Code response
-       │
-       ▼
-Stop hook fires
-       │
-       ▼
-cost_tracker.py reads transcript JSONL
-calculates cost by model & token type
-writes → ~/.claude/cost_tracker.json
-       │
-       ▼
-VSCode extension reads the file
-updates status bar in real time
+        │
+        ▼
+Stop hook (cost_tracker.py)
+        │  reads transcript JSONL, computes cost per model
+        ├─► ~/.claude/cost_tracker.json   (summary)
+        ├─► ~/.claude/cost_log.jsonl      (detailed log)
+        └─► POST sync server (if configured)
+                 │
+                 ▼
+              SQLite on your VPS
+                 │
+                 ▼
+        VSCode webview pulls /report and /summary
 ```
 
-## Requirements
-
-- macOS / Linux
-- Python 3
-- VSCode
-- [Claude Code](https://claude.ai/code) CLI
-
-## Installation
+## Install (client only — local mode)
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/kindcasper/ClaudeCost.git
 cd ClaudeCost
 ./install.sh
 ```
 
-Then **restart VSCode**. The cost tracker appears in the bottom-right status bar.
+Restart VSCode. Cost shows up in the status bar (bottom-right), click for full report.
+
+## Multi-machine sync (optional)
+
+1. Set up the server — see [server/README.md](server/README.md).
+2. Generate one API key per machine with `openssl rand -hex 32`.
+3. On each machine, edit `~/.claude/cost_sync.env`:
+   ```
+   CLAUDE_COST_API_URL=https://your.server/dev/cost
+   CLAUDE_COST_API_KEY=that-machine's-key
+   ```
+4. To backfill existing history:
+   ```bash
+   python3 ~/.claude/hooks/backfill_to_server.py
+   ```
+
+The VSCode report has a Local/Remote toggle and per-client breakdown.
 
 ## Pricing
 
-Costs are calculated using official Anthropic API prices per million tokens:
+Costs use Anthropic's official API rates per million tokens, per model:
 
-| Model | Input | Cache 5m write | Cache 1h write | Cache hit | Output |
-|-------|------:|---------------:|---------------:|----------:|-------:|
-| Claude Opus 4.7 / 4.6 / 4.5 | $5 | $6.25 | $10 | $0.50 | $25 |
-| Claude Opus 4.1 / 4 / 3 | $15 | $18.75 | $30 | $1.50 | $75 |
-| Claude Sonnet 4.6 / 4.5 / 4 / 3.7 | $3 | $3.75 | $6 | $0.30 | $15 |
-| Claude Haiku 4.5 | $1 | $1.25 | $2 | $0.10 | $5 |
-| Claude Haiku 3.5 | $0.80 | $1 | $1.6 | $0.08 | $4 |
-| Claude Haiku 3 | $0.25 | $0.30 | $0.50 | $0.03 | $1.25 |
+| Model family | Input | Cache 5m | Cache 1h | Cache hit | Output |
+|--------------|------:|---------:|---------:|----------:|-------:|
+| Opus 4.7 / 4.6 / 4.5 | $5 | $6.25 | $10 | $0.50 | $25 |
+| Opus 4.1 / 4 / 3 | $15 | $18.75 | $30 | $1.50 | $75 |
+| Sonnet 4.x / 3.7 | $3 | $3.75 | $6 | $0.30 | $15 |
+| Haiku 4.5 | $1 | $1.25 | $2 | $0.10 | $5 |
+| Haiku 3.5 | $0.80 | $1 | $1.6 | $0.08 | $4 |
 
-The model is detected automatically from the transcript — no configuration needed.
+The model is detected per-message from the transcript.
 
-> **Note:** If you're on a Claude Pro / Max / Enterprise subscription, costs shown are the API-equivalent prices, not what you actually pay.
+> If you're on a Claude Pro / Max / Enterprise subscription, the dollar figures are the API-equivalent cost, not what you actually pay.
 
-## Usage
+## Files at runtime
 
-- **Click** the status bar item to see a breakdown by day
-- **Command palette** → `Claude Cost: Show Breakdown`
-- **Command palette** → `Claude Cost: Reset Today's Counter`
-
-## Files
-
-| File | Description |
-|------|-------------|
-| `hooks/cost_tracker.py` | Claude Code Stop hook — runs after each response |
-| `vscode-extension/extension.js` | VSCode extension — reads the JSON and shows status bar |
-| `vscode-extension/package.json` | Extension manifest |
-| `install.sh` | One-command installer |
-
-## Data file
-
-Stats are stored in `~/.claude/cost_tracker.json`:
-
-```json
-{
-  "total_cost": 2.49,
-  "total_requests": 74,
-  "by_day": {
-    "2026-04-24": 2.49
-  },
-  "last_updated": "2026-04-24 09:21 UTC"
-}
-```
-
-## Uninstall
-
-```bash
-rm -rf ~/.vscode/extensions/claude-cost-tracker-0.1.0
-rm ~/.claude/hooks/cost_tracker.py
-rm ~/.claude/cost_tracker.json
-# Remove the "hooks" block from ~/.claude/settings.json
-```
+| Path | Purpose |
+|------|---------|
+| `~/.claude/hooks/cost_tracker.py` | Stop hook |
+| `~/.claude/cost_tracker.json` | Summary (totals, by-day, by-project, by-model) |
+| `~/.claude/cost_log.jsonl` | Per-request detailed log |
+| `~/.claude/cost_sync.env` | Remote sync config (gitignored) |
+| `~/.claude/cost_sync_state.json` | Last successful sync info |
